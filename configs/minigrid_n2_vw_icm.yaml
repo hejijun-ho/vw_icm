@@ -1,0 +1,35 @@
+env: MiniGrid-MultiRoom-N2-S4-v0
+action_space: discrete
+total_steps: 500000
+max_steps: 500
+seed: 42
+
+encoder:
+  type: auto
+  feature_dim: 128
+
+icm:
+  type: vw
+  intrinsic_coeff: 0.01
+  normalize_intrinsic: true
+  intrinsic_decay_start: 0.8
+  ema_alpha: 0.01
+  warmup_steps: 500
+  forward_loss_coeff: 0.2
+  inverse_loss_coeff: 0.8
+
+ppo:
+  lr: 2.5e-4
+  n_steps: 128
+  n_epochs: 4
+  batch_size: 128
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  vf_coeff: 0.5
+  ent_coeff: 0.01
+
+logging:
+  log_dir: runs/n2_vw_icm
+  save_freq: 50000
+  log_freq: 5
