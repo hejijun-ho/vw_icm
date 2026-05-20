@@ -16,7 +16,7 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from envs import make_env
+from envs import make_env, make_vec_env
 from icm import make_encoder, StandardICM, VWICM
 from algorithms.ppo import PPO, ActorCritic
 
@@ -94,10 +94,17 @@ def main():
     icm_type = cfg["icm"]["type"]
     print(f"Device: {device} | ICM: {icm_type} | Env: {cfg['env']}")
 
-    env, obs_type = make_env(cfg["env"], seed=seed, max_steps=cfg.get("max_steps", None))
-    obs_shape = env.observation_space.shape
-    is_discrete = cfg.get("action_space", "discrete") == "discrete"
-    action_dim = env.action_space.n if is_discrete else env.action_space.shape[0]
+    n_envs = cfg.get("n_envs", 1)
+    if n_envs > 1:
+        env, obs_type = make_vec_env(cfg["env"], n_envs=n_envs, seed=seed, max_steps=cfg.get("max_steps", None))
+        obs_shape  = env.single_observation_space.shape
+        is_discrete = cfg.get("action_space", "discrete") == "discrete"
+        action_dim = env.single_action_space.n if is_discrete else env.single_action_space.shape[0]
+    else:
+        env, obs_type = make_env(cfg["env"], seed=seed, max_steps=cfg.get("max_steps", None))
+        obs_shape  = env.observation_space.shape
+        is_discrete = cfg.get("action_space", "discrete") == "discrete"
+        action_dim = env.action_space.n if is_discrete else env.action_space.shape[0]
 
     enc_cfg = cfg["encoder"]
     encoder = make_encoder(obs_shape, enc_cfg["feature_dim"], enc_cfg.get("type", "auto"))
@@ -141,7 +148,8 @@ def main():
     decay_start_frac = cfg["icm"].get("intrinsic_decay_start", None)
     decay_start_step = int(decay_start_frac * total_steps) if decay_start_frac is not None else None
 
-    n_updates = total_steps // n_steps
+    steps_per_update = n_steps * n_envs
+    n_updates = total_steps // steps_per_update
     steps_done = 0
     ep_returns = []
     first_success_step = None
@@ -167,7 +175,7 @@ def main():
 
         rollout = agent.collect_rollout(env, episode_returns=ep_returns)
         update_info = agent.update(rollout)
-        steps_done += n_steps
+        steps_done += steps_per_update
 
         if update % log_freq == 0:
             # TensorBoard
@@ -212,7 +220,7 @@ def main():
 
             logger.info(line)
 
-        if steps_done % save_freq < n_steps:
+        if steps_done % save_freq < steps_per_update:
             agent.save(os.path.join(log_dir, f"ckpt_{steps_done}.pt"))
 
     agent.save(os.path.join(log_dir, "final.pt"))

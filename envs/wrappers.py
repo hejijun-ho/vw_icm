@@ -1,6 +1,7 @@
 import numpy as np
 import gymnasium as gym
 from gymnasium import ObservationWrapper, Wrapper
+from functools import partial
 from typing import Tuple
 import minigrid  # registers MiniGrid envs into gymnasium
 
@@ -71,6 +72,33 @@ class EpisodeStatsWrapper(Wrapper):
                 "length": self._ep_length,
             }
         return obs, reward, terminated, truncated, info
+
+
+def _make_single_env(env_id: str, seed: int, max_steps):
+    """Module-level factory (picklable) for AsyncVectorEnv workers."""
+    env, _ = make_env(env_id, seed=seed, max_steps=max_steps)
+    return env
+
+
+def make_vec_env(
+    env_id: str, n_envs: int = 8, seed: int = 0, max_steps: int = None
+) -> Tuple[gym.vector.VectorEnv, str]:
+    """Create n_envs parallel environments via AsyncVectorEnv.
+
+    Returns (vec_env, obs_type) where obs_type is 'image' or 'flat'.
+    Each worker env i gets seed = seed + i for diverse initial states.
+    """
+    fns = [partial(_make_single_env, env_id, seed + i, max_steps) for i in range(n_envs)]
+    vec_env = gym.vector.AsyncVectorEnv(fns)
+
+    # Detect obs_type from the single observation space
+    single_space = vec_env.single_observation_space
+    if len(single_space.shape) == 3:
+        obs_type = "image"
+    else:
+        obs_type = "flat"
+
+    return vec_env, obs_type
 
 
 def make_env(env_id: str, seed: int = 0, render_mode: str = None, max_steps: int = None) -> Tuple[gym.Env, str]:

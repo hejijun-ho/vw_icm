@@ -84,10 +84,10 @@ class EMAVariance(nn.Module):
             return torch.ones_like(self.ema_var)
 
         mean_var = self.ema_var.mean().clamp(min=1e-8)
-        raw = (self.ema_var / mean_var).clamp(min=0.0, max=5.0)
-        # Renormalize so mean(weights)=1: total intrinsic reward scale stays
-        # equal to standard ICM; only redistribution across dims changes.
-        return raw / raw.mean().clamp(min=1e-8)
+        # Normalize by mean so isotropic case gives all-ones weights.
+        # Clamp after (not before) normalizing so the cap is never violated
+        # by a subsequent renorm step.
+        return (self.ema_var / mean_var).clamp(min=0.0, max=5.0)
 
     @property
     def anisotropy(self) -> float:

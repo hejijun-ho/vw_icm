@@ -3,6 +3,7 @@ action_space: discrete
 total_steps: 5000000
 max_steps: 2000
 seed: 42
+n_envs: 8
 
 encoder:
   type: auto

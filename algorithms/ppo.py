@@ -92,6 +92,9 @@ class PPO(BaseAlgorithm):
         self.intrinsic_coeff = intrinsic_coeff
         self.normalize_intrinsic = normalize_intrinsic
         self._intr_rms = RunningMeanStd() if normalize_intrinsic else None
+        # Persistent env state across rollouts (avoids resetting mid-episode)
+        self._last_obs = None
+        self._ep_rets: Optional[np.ndarray] = None
 
         # Collect unique parameters (encoder is shared between ac and icm)
         seen = set()
@@ -101,6 +104,7 @@ class PPO(BaseAlgorithm):
                 seen.add(id(p))
                 params.append(p)
         self.optimizer = torch.optim.Adam(params, lr=lr)
+        self._all_params = params  # for gradient clipping (covers encoder + AC + ICM)
 
     # ------------------------------------------------------------------
     # Rollout collection
@@ -110,14 +114,26 @@ class PPO(BaseAlgorithm):
         self, env, icm: Optional[nn.Module] = None, episode_returns: Optional[list] = None
     ) -> Dict[str, Any]:
         icm = icm or self.icm
-        obs_list, act_list, rew_list, done_list, val_list, logp_list = [], [], [], [], [], []
-        next_obs_list = []
+        n_envs = getattr(env, "num_envs", 1)
+        is_vec = n_envs > 1
+
+        obs_buf, next_obs_buf, act_buf = [], [], []
+        rew_buf, done_buf, val_buf, logp_buf = [], [], [], []
         intr_rewards = []
 
-        obs, _ = env.reset()
-        ep_ret = 0.0
+        # Resume from previous rollout's final state; only reset on first call
+        if self._last_obs is None:
+            obs, _ = env.reset()
+            self._ep_rets = np.zeros(n_envs, dtype=np.float32)
+        else:
+            obs = self._last_obs
+        ep_rets = self._ep_rets
+
         for _ in range(self.n_steps):
-            obs_t = self._to_tensor(obs).unsqueeze(0)
+            obs_t = self._to_tensor(obs)
+            if not is_vec:
+                obs_t = obs_t.unsqueeze(0)
+
             with torch.no_grad():
                 dist, value = self.ac(obs_t)
                 action = dist.sample()
@@ -125,59 +141,109 @@ class PPO(BaseAlgorithm):
                 if not self.ac.is_discrete:
                     logp = logp.sum(-1)
 
-            act = action.squeeze(0).cpu().numpy()
-            next_obs, reward, terminated, truncated, _ = env.step(
-                int(act) if self.ac.is_discrete else act
-            )
-            done = terminated or truncated
-            ep_ret += reward
-
-            obs_list.append(obs)
-            act_list.append(act)
-            next_obs_list.append(next_obs)
-            done_list.append(done)
-            val_list.append(value.item())
-            logp_list.append(logp.item())
-
-            # Augment reward with intrinsic signal
-            if icm is not None:
-                obs_t2 = self._to_tensor(next_obs).unsqueeze(0)
-                action_t = action.to(self.device)
-                with torch.no_grad():
-                    intr, _, _ = icm(obs_t, action_t, obs_t2)
-                intr_val = intr.item()
-                if self._intr_rms is not None:
-                    self._intr_rms.update(intr_val)
-                    intr_val = self._intr_rms.normalize(intr_val)
-                intr_rewards.append(intr_val)
-                reward = reward + self.intrinsic_coeff * intr_val
-
-            rew_list.append(reward)
-
-            if done:
-                if episode_returns is not None:
-                    episode_returns.append(ep_ret)
-                ep_ret = 0.0
-                obs, _ = env.reset()
+            if is_vec:
+                acts_np = action.cpu().numpy()
             else:
-                obs = next_obs
+                a = action.squeeze(0)
+                acts_np = int(a.cpu().numpy()) if self.ac.is_discrete else a.cpu().numpy()
+
+            next_obs, rewards, terminated, truncated, infos = env.step(acts_np)
+            dones = (terminated | truncated) if is_vec else (terminated or truncated)
+
+            ep_rets += rewards if is_vec else np.array([rewards])
+            if is_vec:
+                for i, d in enumerate(dones):
+                    if d and episode_returns is not None:
+                        episode_returns.append(float(ep_rets[i]))
+                        ep_rets[i] = 0.0
+            else:
+                if dones:
+                    if episode_returns is not None:
+                        episode_returns.append(float(ep_rets[0]))
+                    ep_rets[0] = 0.0
+
+            # For ICM: use terminal obs (not auto-reset obs) at episode boundaries
+            icm_next_obs = next_obs
+            if is_vec and dones.any():
+                final_obs = infos.get("final_observation", None)
+                if final_obs is not None:
+                    icm_next_obs = next_obs.copy()
+                    for i, d in enumerate(dones):
+                        if d and final_obs[i] is not None:
+                            icm_next_obs[i] = final_obs[i]
+
+            aug_rewards = rewards.copy() if is_vec else rewards
+            if icm is not None:
+                next_obs_t = self._to_tensor(icm_next_obs)
+                if not is_vec:
+                    next_obs_t = next_obs_t.unsqueeze(0)
+                with torch.no_grad():
+                    intr, _, _ = icm(obs_t, action.to(self.device), next_obs_t)
+                intr_np = intr.detach().cpu().numpy()
+
+                if self._intr_rms is not None:
+                    for iv in intr_np:
+                        self._intr_rms.update(float(iv))
+                    norm_intr = np.array([self._intr_rms.normalize(float(iv)) for iv in intr_np])
+                else:
+                    norm_intr = intr_np
+
+                intr_rewards.append(float(norm_intr.mean()))
+                aug_rewards = aug_rewards + self.intrinsic_coeff * (norm_intr if is_vec else norm_intr[0])
+
+            obs_buf.append(obs)
+            next_obs_buf.append(icm_next_obs)
+            act_buf.append(acts_np)
+            rew_buf.append(aug_rewards)
+            done_buf.append(dones)
+            val_buf.append(value.detach().cpu().numpy() if is_vec else value.item())
+            logp_buf.append(logp.detach().cpu().numpy() if is_vec else logp.item())
+
+            if not is_vec:
+                obs = next_obs if not dones else env.reset()[0]
+            else:
+                obs = next_obs  # gymnasium vec env auto-resets done envs
+
+        self._last_obs = obs  # carry over for next rollout
 
         # Bootstrap value for last state
-        obs_t = self._to_tensor(obs).unsqueeze(0)
+        last_obs_t = self._to_tensor(obs)
+        if not is_vec:
+            last_obs_t = last_obs_t.unsqueeze(0)
         with torch.no_grad():
-            last_val = self.ac.get_value(obs_t).item()
+            last_val = self.ac.get_value(last_obs_t).detach().cpu().numpy()
 
-        returns, advantages = self._compute_gae(
-            rew_list, val_list, done_list, last_val
-        )
+        if is_vec:
+            rew_arr  = np.array(rew_buf,  dtype=np.float32)   # (T, N)
+            val_arr  = np.array(val_buf,  dtype=np.float32)   # (T, N)
+            done_arr = np.array(done_buf, dtype=np.float32)   # (T, N)
+            returns, advantages = self._compute_gae_vec(
+                rew_arr, val_arr, done_arr, last_val.flatten()
+            )
+            S = obs_buf[0].shape[1:]  # single obs shape
+            obs_flat      = np.array(obs_buf).reshape(-1, *S)
+            next_obs_flat = np.array(next_obs_buf).reshape(-1, *S)
+            act_arr       = np.array(act_buf)             # (T, N) discrete or (T, N, A) continuous
+            act_flat      = act_arr.reshape(-1, *act_arr.shape[2:])  # (T*N,) or (T*N, A)
+            logp_flat     = np.array(logp_buf).reshape(-1)
+            ret_flat      = returns.flatten()
+            adv_flat      = advantages.flatten()
+        else:
+            obs_flat      = np.array(obs_buf)
+            next_obs_flat = np.array(next_obs_buf)
+            act_flat      = np.array(act_buf)
+            logp_flat     = np.array(logp_buf)
+            ret_flat, adv_flat = self._compute_gae(
+                rew_buf, val_buf, done_buf, float(last_val)
+            )
 
         return {
-            "obs": np.array(obs_list),
-            "next_obs": np.array(next_obs_list),
-            "actions": np.array(act_list),
-            "returns": returns,
-            "advantages": advantages,
-            "log_probs": np.array(logp_list),
+            "obs":              obs_flat,
+            "next_obs":         next_obs_flat,
+            "actions":          act_flat,
+            "returns":          ret_flat,
+            "advantages":       adv_flat,
+            "log_probs":        logp_flat,
             "intr_reward_mean": float(np.mean(intr_rewards)) if intr_rewards else 0.0,
         }
 
@@ -236,7 +302,7 @@ class PPO(BaseAlgorithm):
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
+                nn.utils.clip_grad_norm_(self._all_params, 0.5)
                 self.optimizer.step()
 
                 total_pg += pg_loss.item()
@@ -263,6 +329,22 @@ class PPO(BaseAlgorithm):
             return x.to(self.device)
         t = torch.tensor(np.array(x), dtype=torch.float32, device=self.device)
         return t
+
+    def _compute_gae_vec(self, rewards, values, dones, last_values):
+        """GAE for vectorized envs. All inputs are (T, N) arrays."""
+        n_steps, n_envs = rewards.shape
+        returns    = np.zeros_like(rewards)
+        advantages = np.zeros_like(rewards)
+        gae      = np.zeros(n_envs, dtype=np.float32)
+        next_val = last_values.astype(np.float32)
+        for t in reversed(range(n_steps)):
+            mask     = 1.0 - dones[t]
+            delta    = rewards[t] + self.gamma * next_val * mask - values[t]
+            gae      = delta + self.gamma * self.gae_lambda * mask * gae
+            advantages[t] = gae
+            returns[t]    = gae + values[t]
+            next_val = values[t]
+        return returns, advantages
 
     def _compute_gae(self, rewards, values, dones, last_value):
         n = len(rewards)

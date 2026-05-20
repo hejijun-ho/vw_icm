@@ -48,7 +48,7 @@ class StandardICM(nn.Module):
 
     def forward(
         self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute intrinsic reward and ICM losses.
 
         Args:

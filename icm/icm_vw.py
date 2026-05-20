@@ -87,9 +87,12 @@ class VWICM(nn.Module):
         phi_s_next = self.encoder(next_obs)
         action_enc = self._encode_action(action)
 
-        # Track variance of δ to identify "active" feature dimensions
+        # Track variance of δ to identify "active" feature dimensions.
+        # Only update when batch_size > 1: single-step rollout calls produce
+        # zero batch variance and only decay ema_var without adding signal.
         delta = (phi_s_next - phi_s).detach()
-        self.variance_tracker.update(delta)
+        if delta.shape[0] > 1:
+            self.variance_tracker.update(delta)
         weights = self.variance_tracker.weights.to(obs.device)  # (D,)
 
         # Forward model: predict φ(s') directly (same target as standard ICM)
